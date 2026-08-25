@@ -60,6 +60,10 @@ def get_args():
     parser.add_argument('--k_features', type = int, default=10)
     parser.add_argument('--n_c', type = float, default=0.95)
     parser.add_argument('--need_preprocess', action='store_true')
+    parser.add_argument('--save_final_model', action='store_true',
+                        help='Whether to train on full data and save a deployable final model.')
+    parser.add_argument('--final_model_name', type=str, default='final_model.joblib',
+                        help='Output filename for saved final model artifact.')
 
     args = parser.parse_args()
     return args
@@ -400,6 +404,48 @@ def objective_detailed(best_trial, X_train, y_train, X_test, y_test, clf_name,re
     return y_true, y_pred, y_score, feature_importance
 
 
+def fit_final_pipeline(best_trial, X_train, y_train, clf_name, resample=True,
+                       k_features=20, n_c=0.95, config=None):
+    select_func = f_classif
+    features_in = X_train.columns
+    clf = model_init(best_trial, clf_name)
+
+    scaler = StandardScaler()
+    X_train_new = scaler.fit_transform(X_train)
+
+    selector = None
+    feature_selected = features_in
+    if k_features > 0:
+        n_features = X_train_new.shape[1]
+        if n_features >= k_features:
+            selector = SelectKBest(score_func=select_func, k=k_features)
+            X_train_new = selector.fit_transform(X_train_new, y_train)
+            feature_selected = selector.get_feature_names_out(features_in)
+
+    pca = None
+    if n_c > 0:
+        pca = PCA(n_components=n_c)
+        X_train_new = pca.fit_transform(X_train_new)
+
+    if resample:
+        smote = SMOTETomek(random_state=SEED)
+        X_train_new, y_train = smote.fit_resample(X_train_new, y_train)
+
+    clf.fit(X_train_new, y_train)
+
+    return {
+        'clf_name': clf_name,
+        'best_params': best_trial.params,
+        'feature_columns': list(features_in),
+        'selected_features': list(feature_selected),
+        'scaler': scaler,
+        'selector': selector,
+        'pca': pca,
+        'clf': clf,
+        'config': config if config is not None else {},
+    }
+
+
 def get_config_hash(config):
     """基于config内容生成一个唯一的hash"""
     config_str = json.dumps(config, sort_keys=True)
@@ -557,6 +603,34 @@ def main():
 
     print('best model performance:')
     print(f'{best_model} auroc: {best_score}')
+
+    if args.save_final_model:
+        print(f'train and save final model with full data: {best_model}')
+        objective_with_data = functools.partial(
+            objective,
+            X_train=X,
+            y_train=y,
+            clf_name=best_model,
+            k_features=k_features,
+            resample=resample
+        )
+        sampler = TPESampler(seed=SEED)
+        study = optuna.create_study(sampler=sampler, direction='maximize')
+        study.optimize(objective_with_data, n_trials=args.n_trials, n_jobs=args.n_jobs)
+
+        final_pipeline = fit_final_pipeline(
+            study.best_trial,
+            X_train=X,
+            y_train=y,
+            clf_name=best_model,
+            k_features=k_features,
+            n_c=n_c,
+            resample=resample,
+            config=config,
+        )
+        final_model_path = os.path.join(save_dir, args.final_model_name)
+        joblib.dump(final_pipeline, final_model_path)
+        print(f'final model saved to: {final_model_path}')
     
     
 if __name__ == '__main__':

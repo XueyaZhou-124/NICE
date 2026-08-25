@@ -1,167 +1,209 @@
-# SECM-cfDNA Embryo Origin Discrimination and Quality Assessment Pipeline
+# NICE
 
-Source code for *NICE: A Two-Step Non-Invasive Framework for Embryo cfDNA Read Enrichment and Quality Assessment*
+Source code for *NICE: A Two-Step Non-Invasive Framework for Embryo cfDNA Read Enrichment and Quality Assessment*.
 
  It employs **DECENT-plus** (a deep learning model) to distinguish between maternal contamination and embryo-derived reads, followed by a multi-dimensional feature extraction process to facilitate embryo quality assessment (Probability of being a "High-quality Embryo").
 
 ---
 
-## 📋 Overview
+## Overview
 
-* **Input**: SECM BAM files (containing `XG/XM` methylation tags) and scBS-seq files from PB/Cumulus(maternal source) & TE/ICM(embyoric source) (for stage1 *Decent-plus* training).
-* **Stage 1 (Purification)**: Train DECENT-plus  predict maternal probability per read, Filter embryo-derived reads based on a threshold, Generate "purified" BAM.
-* **Stage 2 (Feature Extraction & Classification)**: Extract 6 categories of features (TM, TRN, GWM, EM, FLEN, CNA). Generate one CSV per feature type (one row per sample). And downstream machine learning for embryo quality assessment.
+- **Input**: SECM BAM files with `XG`/`XM` methylation tags. Stage 1 training additionally uses scBS-seq from PB/Cumulus (maternal) and TE/ICM (embryonic).
+- **Stage 1 (Purification)**: Train or apply DECENT-plus, score each read for maternal origin, and write a purified BAM of embryo-derived reads.
+- **Stage 2 (Features & Classification)**: Extract target methylation, GWM, end motif, fragment length, genome-wide read counts, and optional CNA. Train or apply the NICE classifier.
 
 ---
 
-## 💻 Environment
+## Environment
 
 ```bash
 pip install -r requirements.txt
-
 ```
 
-**External Dependencies**:
+Also required on `$PATH`: `samtools`, `bedtools`, and `perl` (for single-C conversion).
 
-* `samtools`, `bedtools` must be installed in your `$PATH`.
+Run Python modules from the repository root, and set `PYTHONPATH` to that root if needed:
+
+```bash
+export PYTHONPATH="$(pwd)"
+```
+
+---
+
+## Data included in this repository
+
+- `data/decent_plus_trained_30M.pth`: pretrained DECENT-plus weights.
+- `data/TableS2_Target_region_feature/`: target-region annotation files used for target methylation features.
 
 
 ---
 
-## 🔬 Stage 1: DECENT-plus Training & Prediction
+## Stage 1: DECENT-plus training and prediction
 
-### 1.1 BAM Preprocessing (Preparing for Training)
+### 1.1 BAM preprocessing
 
-Convert **Single-cell Methylation BAMs** (known cell types) into ID-labeled BAMs and `.reads` files:
+Convert single-cell methylation BAMs (known cell types) into ID-labeled BAMs and `.reads` files:
 
 ```bash
-# Assign numerical IDs to every read in the BAM (for tracking)
-python -m stage1_decent.bam_preprocess id_bam \
+python -m stage1_filtering.bam_preprocess id_bam \
   --original_bam_path <cell_type_sample>.bam \
   --new_bam_path <cell_type_sample>.id.bam
 
-# Extract .reads files (Sequence + Methylation status for 132bp)
-python -m stage1_decent.bam_preprocess extract \
+python -m stage1_filtering.bam_preprocess extract \
   --bam_path <cell_type_sample>.id.bam \
   --reads_dir <reads_dir>
-
 ```
 
-### 1.2 Training the Model
+### 1.2 Training
 
-Configure cell types in `stage1_decent/train.py` (Default: Cumulus/PB = 0 [Maternal], TE/ICM = 1 [Embryo]):
+Default labels in `stage1_filtering/train.py`: Cumulus/PB = 0 (maternal), TE/ICM = 1 (embryo).
 
 ```bash
-python -m stage1_decent.train \
+python -m stage1_filtering.train \
   --reads_dir <reads_dir> \
   --save_dir <checkpoint_dir> \
-  [--datasize 7500000] [--epochs 30] [--batch_size 128]
-
+  --datasize 7500000 \
+  --epochs 30 \
+  --batch_size 128
 ```
 
-### 1.3 SECM Prediction & Embryo Read Filtering
-
-Run prediction on SECM `.id.bam` files:
+### 1.3 SECM prediction and embryo-read filtering
 
 ```bash
-python -m stage1_decent.predict_and_filter \
+python -m stage1_filtering.predict_and_filter \
   --bam_path <sample>.id.bam \
-  --model_path <path/to/model_epoch_15.pth> \ # trained decent-plus
+  --model_path data/decent_plus_trained_30M.pth \
   --reads_dir <temp_reads_dir> \
-  --res_dir <output_csv_dir> \ # probability of maternal source per read
-  --threshold 0.2 # filter threshold for reads filteration
-
+  --res_dir <output_csv_dir> \
+  --threshold 0.2
 ```
 
-* **CSV Output**: `res_dir/<sample>.csv` (Columns: `header`, `C-score`). Reads with **C-score** are classified as Maternal-derived.
-* **BAM Output**: `<sample>_02.bam` (Contains only reads with C-score <= 0.2, serve as purified reads from embyro).
+- **CSV**: `<output_csv_dir>/<sample>.csv` with columns `header` and `C-score`. Higher C-score means more likely maternal.
+- **BAM**: `<sample>_02.bam` keeps reads with C-score `<= 0.2` (purified embryo-derived reads).
+
+Batch helpers:
+
+```bash
+bash scripts/run_stage1_predict_batch.sh <sample_list.txt> <BAM_ROOT> <MODEL_PATH> <RES_DIR> 0.2
+bash scripts/run_stage1_predict_parallel.sh <sample_list.txt> <BAM_ROOT> <MODEL_PATH> <RES_DIR> 0.2 6
+```
+
+`sample_list.txt` is one sample ID per line. Each BAM is expected at `<BAM_ROOT>/<sample>/<sample>_id.bam`.
 
 ---
 
-## 📊 Stage 2: Feature Extraction
+## Stage 2: Feature extraction and embryo assessment
 
-### 2.1 Low-level Processing (BAM to Methylation)
-
-* **BAM to singleC**: Use `stage2_features/run_bam_to_singleC.sh`.
-* **Target Region Methylation (TRM)**: Use `run_target_methylation.sh`.
-* **Genome-wide Bin Methylation (GWM)**: Use `run_gwm.sh`.
-
-### 2.2 Feature Matrix Aggregation
-
-Aggregate all extracted data into structured CSVs using the master extraction script:
+### 2.1 BAM to single-C methylation
 
 ```bash
-python stage2_features/feature_extraction.py \
+bash stage2_evaluation/run_bam_to_singleC.sh \
+  <REF_FA> \
+  <BAM_DIR> \
+  <SAMPLE> \
+  _id_02.bam \
+  <OUT_SINGLEC_DIR> \
+  stage2_evaluation/singleC_metLevel.hg19.pl
+```
+
+`REF_FA` should be an hg19 FASTA (plus lambda if used). Edit the reference path inside `singleC_metLevel.hg19.pl` to match your local genome FASTA before running.
+
+Target-region methylation and genome-wide bin methylation (GWM) should be prepared from these single-C files, then aggregated in the next step. Region annotations live in `data/TableS2_Target_region_feature/`.
+
+### 2.2 Feature matrix aggregation
+
+```bash
+python stage2_evaluation/feature_extraction.py \
   --target_methy_path <path_to_target_methylation_dir> \
   --gwm_path <path_to_gwm_dir> \
   --sample_info <sample_label.xlsx_or_csv> \
   --bam_path <bam_base_path> \
   --bam_suffix _id_02.bam \
   --save_path <feature_output_dir> \
-  [--bin_bed <hg19_5M.bed>] [--cna_path <cna.tsv>]
-
+  --bin_bed <hg19_5M.bed> \
+  --cnv_path <cna.tsv>
 ```
 
-**Extracted Features (One CSV per type):**
+One CSV is written per feature type:
 
-1. **Target Methylation (TRM)**: Methylation levels at specific genomic regions.
-2. **GWM**: Genome-wide bin-based methylation.
-3. **End Motif**: Frequency of 4-mer DNA end motifs.
-4. **Flen**: Fragment length distribution profiles.
-5. **Total**: Total reads number on genome-wide bin.
-6. **CNV**: Copy Number Variations profiles.
+1. **target_methy**: methylation at annotated target regions
+2. **gwm**: genome-wide bin methylation
+3. **end_motif**: 4-mer DNA end-motif frequencies
+4. **flen**: fragment-length profiles
+5. **total**: read counts in genome-wide bins
+6. **cnv** (optional): copy-number variants
 
-### 2.3 Embyro Assement
+### 2.3 Embryo assessment
 
-Clssify high-quality embyro based on extracted features:
+Train / cross-validate:
 
 ```bash
 python stage2_evaluation/nice.py \
- --data_path target_methy.csv \ # extracted feature
- --save_path <path_to_save_dir> \
- --k_features 10 \ 
- --valid_ratio 1 \
- --resample \
- --n_trials 30 \
- --thereshold 5 \
- --n_c 0.95 \
- --need_preprocess \
- --n_jobs 1
+  --data_path <feature.csv> \
+  --save_path <path_to_save_dir> \
+  --k_features 10 \
+  --valid_ratio 1 \
+  --resample \
+  --n_trials 30 \
+  --thereshold 5 \
+  --n_c 0.95 \
+  --need_preprocess \
+  --n_jobs 1
+```
 
+Predict with a saved model:
+
+```bash
+python stage2_evaluation/nice_predict.py \
+  --model_path <final_model.joblib> \
+  --data_path <feature.csv> \
+  --save_path <predictions.csv>
 ```
 
 ---
 
-## 🛠 Utility Scripts
+## Utility scripts
 
-* **`scripts/cal_contamination_ratio.py`**: Estimates the global maternal contamination ratio for a sample using Maximum Likelihood Estimation (MLE) based on Stage 1 scores.
+- `scripts/cal_contamination_ratio.py`: estimate per-sample maternal contamination from Stage 1 score CSVs (MLE).
+
+```bash
+python scripts/cal_contamination_ratio.py \
+  --res_dir <stage1_score_csv_dir> \
+  --out_file <ratio.txt>
+```
 
 ---
 
-## 📂 Directory Structure
+## Directory structure
 
 ```text
 NICE/
-├── stage1_filtering/           # Training & Prediction (DL)
-│   ├── bam_preprocess.py    # ID assignment & read extraction
-│   ├── train.py             # Model training
-│   ├── predict_and_filter.py# Filtering embryo reads
-│   └── model.py             # Neural network architecture
-├── stage2_evaluation/         # Feature Engineering
+├── stage1_filtering/
+│   ├── bam_preprocess.py      # ID assignment and .reads extraction
+│   ├── train.py               # DECENT-plus training
+│   ├── predict_and_filter.py  # Per-read scoring and BAM filtering
+│   ├── model.py
+│   ├── data_loader.py
+│   └── utils.py
+├── stage2_evaluation/
 │   ├── run_bam_to_singleC.sh
-│   ├── run_gwm.sh
-│   └── feature_extraction.py  # Aggregates 5 feature types into CSVs
-└── scripts/
-    └── cal_contamination_ratio.py # Contamination estimation
-
+│   ├── singleC_metLevel.hg19.pl
+│   ├── feature_extraction.py
+│   ├── nice.py
+│   ├── nice_predict.py
+│   └── run_nice_best_config_5fold.sh
+├── scripts/
+│   ├── cal_contamination_ratio.py
+│   ├── run_stage1_predict_batch.sh
+│   └── run_stage1_predict_parallel.sh
+├── data/
+│   ├── decent_plus_trained_30M.pth
+│   └── TableS2_Target_region_feature/
+├── requirements.txt
+└── LICENSE
 ```
 
 ---
 
-## 📝 Notes & Citation
-
-* **C-score**: Represents the probability of a read being **Maternal**. Therefore, `1 - C-score` is the Embryo probability.
-
 **License**: [MIT License]
 
-Would you like me to help you generate a `requirements.txt` based on these modules?

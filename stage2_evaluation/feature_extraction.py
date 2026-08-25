@@ -18,6 +18,8 @@ from tqdm import tqdm
 
 warnings.filterwarnings('ignore')
 
+PHENO_LABEL_COLS = ['Morphology', 'typeMorphology', 'typeMorphology2']
+
 
 def _read_label(save_path):
     """Load label DataFrame from save_path/label.csv."""
@@ -27,7 +29,149 @@ def _read_label(save_path):
     return pd.read_csv(path, index_col=0)
 
 
-def target_methy_extraction(res_path, save_path, sample_info_path, sample_list_path=None):
+def _normalize_sample_id(sample):
+    """Normalize sample IDs across files, e.g. PBAT_E12_B2_id -> PBAT_E12_B2."""
+    sample = str(sample).strip()
+    if sample.endswith('_id'):
+        sample = sample[:-3]
+    return sample
+
+
+def _resolve_singlec_path(singlec_dir, sample, singlec_suffix):
+    """Resolve singleC path from either nested or flat layout."""
+    nested_path = os.path.join(singlec_dir, sample, sample + singlec_suffix)
+    if os.path.exists(nested_path):
+        return nested_path
+    flat_path = os.path.join(singlec_dir, sample + singlec_suffix)
+    if os.path.exists(flat_path):
+        return flat_path
+    return None
+
+
+def _compute_metrate_from_singlec(singlec_path, min_depth=1):
+    """
+    Genome-wide methylation ratio: sum(Met) / sum(Total) from singleC file.
+    """
+    total_c = 0.0
+    met_c = 0.0
+    for chunk in pd.read_csv(
+        singlec_path,
+        sep='\t',
+        usecols=['Total', 'Met'],
+        chunksize=200000,
+    ):
+        chunk = chunk.apply(pd.to_numeric, errors='coerce')
+        chunk = chunk.dropna(subset=['Total', 'Met'])
+        if min_depth > 1:
+            chunk = chunk.loc[chunk['Total'] >= min_depth]
+        if chunk.empty:
+            continue
+        total_c += float(chunk['Total'].sum())
+        met_c += float(chunk['Met'].sum())
+    if total_c <= 0:
+        return np.nan
+    return met_c / total_c
+
+
+def _build_metrate_series(samples, singlec_dir, singlec_suffix, min_depth=1):
+    """Build Met_Rate series aligned to sample index."""
+    values = {}
+    missing_singlec = []
+    for sample in samples:
+        singlec_path = _resolve_singlec_path(singlec_dir, sample, singlec_suffix)
+        if singlec_path is None:
+            missing_singlec.append(sample)
+            values[sample] = np.nan
+            continue
+        values[sample] = _compute_metrate_from_singlec(singlec_path, min_depth=min_depth)
+    return pd.Series(values, index=samples, dtype=float, name='Met_Rate'), missing_singlec
+
+
+def _cal_ratio_from_stage1_csv(csv_path, gaps=1000):
+    """Estimate contamination ratio from stage1 score CSV, aligned with cal_contamination_ratio.py."""
+    df = pd.read_csv(csv_path)
+    score_cols = [c for c in df.columns if 'score' in c.lower()]
+    if 'C-score' in df.columns:
+        score_col = 'C-score'
+    elif score_cols:
+        score_col = score_cols[0]
+    else:
+        raise ValueError(f'No score column found in {csv_path}')
+    likelihood_1 = df[score_col].astype(np.float64).values
+    likelihood_2 = 1.0 - likelihood_1
+    best_sum, best_gap = -np.inf, 0.0
+    for gap in np.linspace(0, 1, int(gaps)):
+        total = np.nansum(np.log10(gap * likelihood_1 + (1.0 - gap) * likelihood_2))
+        if total > best_sum:
+            best_sum, best_gap = total, round(float(gap), 3)
+    return best_gap
+
+
+def _load_ratio_file(ratio_file):
+    """Load contamination ratio file with columns: sample, ratio, loglik."""
+    ratio_df = pd.read_csv(
+        ratio_file,
+        sep='\t',
+        header=None,
+        names=['sample_raw', 'r_contam', 'loglik'],
+    )
+    ratio_df['sample'] = ratio_df['sample_raw'].map(_normalize_sample_id)
+    ratio_df['r_contam'] = pd.to_numeric(ratio_df['r_contam'], errors='coerce')
+    ratio_df = ratio_df.dropna(subset=['sample', 'r_contam'])
+    ratio_df = ratio_df.drop_duplicates(subset=['sample'], keep='last')
+    ratio_df = ratio_df.set_index('sample')
+    return ratio_df['r_contam']
+
+
+def _build_ratio_series(samples, ratio_file=None, stage1_res_dir=None, ratio_grid_size=1000):
+    """
+    Build contamination ratio series for samples.
+    Priority: ratio_file -> on-the-fly from stage1 score CSV.
+    """
+    if ratio_file and os.path.exists(ratio_file):
+        ratio_series = _load_ratio_file(ratio_file)
+        source = f'ratio_file:{ratio_file}'
+    elif stage1_res_dir and os.path.exists(stage1_res_dir):
+        values = {}
+        for sample in samples:
+            csv_path = os.path.join(stage1_res_dir, f'{sample}_id.csv')
+            if not os.path.exists(csv_path):
+                continue
+            values[sample] = _cal_ratio_from_stage1_csv(csv_path, gaps=ratio_grid_size)
+        ratio_series = pd.Series(values, dtype=float, name='r_contam')
+        source = f'stage1_scores:{stage1_res_dir}'
+    else:
+        raise FileNotFoundError(
+            'No contamination ratio source available. Provide ratio_file or valid stage1_res_dir.'
+        )
+    ratio_series = ratio_series.reindex(samples)
+    missing = ratio_series[ratio_series.isna()].index.tolist()
+    return ratio_series, source, missing
+
+
+def _fit_adjustment_model(met_rate, r_contam):
+    """Fit M_sample = alpha + beta * r_contam and return alpha, beta."""
+    valid = met_rate.notna() & r_contam.notna()
+    if valid.sum() < 2:
+        raise ValueError('Not enough valid samples to fit Met_Rate adjustment model.')
+    x = r_contam.loc[valid].astype(float).values
+    y = met_rate.loc[valid].astype(float).values
+    beta, alpha = np.polyfit(x, y, deg=1)
+    return float(alpha), float(beta), int(valid.sum())
+
+
+def target_methy_extraction(
+    res_path,
+    save_path,
+    sample_info_path,
+    sample_list_path=None,
+    singlec_dir=None,
+    singlec_suffix='_id_02.single5mC',
+    singlec_min_depth=1,
+    ratio_file=None,
+    stage1_res_dir=None,
+    ratio_grid_size=1000,
+):
     """Aggregate target region methylation and build label.csv from sample_info."""
     os.makedirs(save_path, exist_ok=True)
     meth_list = []
@@ -43,10 +187,53 @@ def target_methy_extraction(res_path, save_path, sample_info_path, sample_list_p
         raise FileNotFoundError(f'No .site_methylation.rate.xls in {res_path}')
     all_meth = pd.concat(meth_list)
     new_df = all_meth.pivot_table(index='sample', columns='feature', values='meth_rate')
+    new_df.index = new_df.index.astype(str).str.strip()
     if sample_list_path and os.path.exists(sample_list_path):
         samplelist = pd.read_csv(sample_list_path, header=None)
-        keep = set(samplelist.iloc[:, 0].astype(str))
+        keep = set(samplelist.iloc[:, 0].astype(str).str.strip())
         new_df = new_df.loc[new_df.index.isin(keep)]
+
+    # Integrate sample-level methylation features for Stage2 TM model.
+    if singlec_dir:
+        met_rate, missing_singlec = _build_metrate_series(
+            samples=new_df.index,
+            singlec_dir=singlec_dir,
+            singlec_suffix=singlec_suffix,
+            min_depth=singlec_min_depth,
+        )
+        if missing_singlec:
+            raise FileNotFoundError(
+                f'Missing singleC files for {len(missing_singlec)} samples: '
+                f'{missing_singlec[:5]}{"..." if len(missing_singlec) > 5 else ""}'
+            )
+        if met_rate.isna().any():
+            na_samples = met_rate[met_rate.isna()].index.tolist()
+            raise ValueError(
+                f'Failed to compute Met_Rate for {len(na_samples)} samples: '
+                f'{na_samples[:5]}{"..." if len(na_samples) > 5 else ""}'
+            )
+        new_df['Met_Rate'] = met_rate
+
+        r_contam, ratio_source, missing_ratio = _build_ratio_series(
+            samples=new_df.index,
+            ratio_file=ratio_file,
+            stage1_res_dir=stage1_res_dir,
+            ratio_grid_size=ratio_grid_size,
+        )
+        if missing_ratio:
+            raise ValueError(
+                f'Missing contamination ratios for {len(missing_ratio)} samples: '
+                f'{missing_ratio[:5]}{"..." if len(missing_ratio) > 5 else ""}'
+            )
+
+        alpha, beta, n_fit = _fit_adjustment_model(met_rate, r_contam)
+        met_rate_adj = (met_rate - beta * r_contam).clip(lower=0.0, upper=1.0)
+        new_df.insert(0, 'Met_Rate_adj', met_rate_adj)
+        print(
+            f'Met_Rate/Met_Rate_adj added: n={len(new_df)}, '
+            f'ratio_source={ratio_source}, fit_n={n_fit}, alpha={alpha:.6f}, beta={beta:.6f}'
+        )
+
     if sample_info_path.endswith('.xlsx') or sample_info_path.endswith('.xls'):
         label = pd.read_excel(sample_info_path)
     else:
@@ -55,9 +242,18 @@ def target_methy_extraction(res_path, save_path, sample_info_path, sample_list_p
         label = label.rename(columns={label.columns[0]: 'sample'})
     if 'sample' in label.columns:
         label = label.set_index('sample')
+    label.index = label.index.astype(str).str.strip()
+    overlap_cols = [c for c in label.columns if c in new_df.columns]
+    if overlap_cols:
+        print(f'Warning: dropping overlapping columns from sample_info: {overlap_cols}')
+        label = label.drop(columns=overlap_cols)
+
     df = new_df.join(label, how='outer')
     df = df.dropna(how='all', subset=[c for c in new_df.columns if c in df.columns])
-    label_cols = [c for c in label.columns if c in df.columns]
+    label_cols = [c for c in label.columns if c in df.columns and c not in {'Met_Rate', 'Met_Rate_adj'}]
+    # Keep label.csv focused on phenotype labels to avoid leaking numeric features.
+    if any(c in PHENO_LABEL_COLS for c in label_cols):
+        label_cols = [c for c in label_cols if c in PHENO_LABEL_COLS]
     if label_cols:
         df[label_cols].to_csv(os.path.join(save_path, 'label.csv'))
     df.to_csv(os.path.join(save_path, 'target_methy.csv'))
@@ -247,6 +443,12 @@ def main():
     ap.add_argument('--gwm_path', help='Directory with *_gwm.single5mC2 files')
     ap.add_argument('--sample_info', help='Sample/label table (CSV or Excel) for building label.csv')
     ap.add_argument('--sample_list', help='Optional: list of sample IDs to keep')
+    ap.add_argument('--singlec_dir', help='Directory containing per-sample singleC outputs for Met_Rate')
+    ap.add_argument('--singlec_suffix', default='_id_02.single5mC', help='Suffix of singleC file per sample')
+    ap.add_argument('--singlec_min_depth', type=int, default=1, help='Minimum Total depth when computing Met_Rate')
+    ap.add_argument('--ratio_file', help='Optional contamination ratio file (sample\\tratio\\tloglik)')
+    ap.add_argument('--stage1_res_dir', help='Fallback stage1 score CSV dir to compute contamination ratio')
+    ap.add_argument('--ratio_grid_size', type=int, default=1000, help='Grid size for ratio MLE fallback')
     ap.add_argument('--bam_path', required=True, help='Base path to BAMs: bam_path/SAMPLE/SAMPLE{suffix}.bam')
     ap.add_argument('--bam_suffix', default='_id_02.bam')
     ap.add_argument('--save_path', required=True, help='Output directory; label.csv and feature CSVs written here')
@@ -260,7 +462,16 @@ def main():
 
     if 'target_methy' in args.features and args.target_methy_path and args.sample_info:
         target_methy_extraction(
-            args.target_methy_path, args.save_path, args.sample_info, args.sample_list
+            args.target_methy_path,
+            args.save_path,
+            args.sample_info,
+            args.sample_list,
+            singlec_dir=args.singlec_dir,
+            singlec_suffix=args.singlec_suffix,
+            singlec_min_depth=args.singlec_min_depth,
+            ratio_file=args.ratio_file,
+            stage1_res_dir=args.stage1_res_dir,
+            ratio_grid_size=args.ratio_grid_size,
         )
     if 'gwm' in args.features and args.gwm_path:
         gwm_extraction(args.gwm_path, args.save_path, args.bin_bed)

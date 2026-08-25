@@ -22,17 +22,22 @@ except ImportError:
     from model import DISMIR_deep
 
 
-def read_preprocess(reads_path):
-    """Parse .reads file; return seq, methy, headers."""
+def iter_reads_chunks(reads_path, chunk_size=50000):
+    """Yield (seq, methy, headers) chunks from .reads file."""
     seq, methy, headers = [], [], []
     with open(reads_path, 'r') as f:
         for line in f:
             parts = line.strip().split('\t')
-            if len(parts) > 4:
-                headers.append(parts[0])
-                seq.append(parts[3])
-                methy.append(parts[4])
-    return seq, methy, headers
+            if len(parts) <= 4:
+                continue
+            headers.append(parts[0])
+            seq.append(parts[3])
+            methy.append(parts[4])
+            if len(headers) >= chunk_size:
+                yield seq, methy, headers
+                seq, methy, headers = [], [], []
+    if headers:
+        yield seq, methy, headers
 
 
 def predict_score(bam_path, reads_dir, model_path, res_dir, res_file=None, remove_reads_after=True):
@@ -51,29 +56,40 @@ def predict_score(bam_path, reads_dir, model_path, res_dir, res_file=None, remov
         return out_csv
 
     reads_path = os.path.join(reads_dir, basename + '.reads')
+    os.makedirs(reads_dir, exist_ok=True)
     if not os.path.exists(reads_path):
         extract_reads(bam_path, reads_dir)
-
-    seq, methy, headers = read_preprocess(reads_path)
-    seq_lstm = split_methy(seq, methy)
-    seq_one_hot = conv_onehot(seq_lstm)
-    loader = DataLoader(TensorDataset(seq_one_hot), batch_size=10000)
 
     model = DISMIR_deep(n_classes=2)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.to(device)
     model.eval()
 
-    scores = []
+    wrote_rows = False
+    chunk_idx = 0
     with torch.no_grad():
-        for (inputs,) in tqdm(loader):
-            inputs = inputs.to(device).float()
-            out = model(inputs.permute(0, 2, 1))
-            scores.append(out[:, 0].cpu().numpy())
-    scores = np.concatenate(scores)
-    # C-score: maternal contamination probability (original code used 1 - output as embryo score)
-    c_score = 1 - scores
-    pd.DataFrame({'header': headers, 'C-score': c_score}).to_csv(out_csv, index=False)
+        for seq, methy, headers in iter_reads_chunks(reads_path, chunk_size=50000):
+            seq_lstm = split_methy(seq, methy)
+            seq_one_hot = conv_onehot(seq_lstm)
+            loader = DataLoader(TensorDataset(seq_one_hot), batch_size=10000)
+            scores = []
+            for (inputs,) in tqdm(loader, desc=f'chunk-{chunk_idx}', leave=False):
+                inputs = inputs.to(device).float()
+                out = model(inputs.permute(0, 2, 1))
+                scores.append(out[:, 0].cpu().numpy())
+            if not scores:
+                chunk_idx += 1
+                continue
+            scores = np.concatenate(scores)
+            # C-score: maternal contamination probability (original code used 1 - output as embryo score)
+            c_score = 1 - scores
+            pd.DataFrame({'header': headers, 'C-score': c_score}).to_csv(
+                out_csv, index=False, mode='a', header=(not wrote_rows)
+            )
+            wrote_rows = True
+            chunk_idx += 1
+    if not wrote_rows:
+        pd.DataFrame({'header': [], 'C-score': []}).to_csv(out_csv, index=False)
     if remove_reads_after and os.path.exists(reads_path):
         os.remove(reads_path)
     return out_csv
