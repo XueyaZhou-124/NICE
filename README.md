@@ -1,8 +1,8 @@
 # NICE
 
-Source code for *NICE: A Two-Step Non-Invasive Framework for Embryo cfDNA Read Enrichment and Quality Assessment*.
+Source code for [NICE: A Two-Step Non-Invasive Framework for Embryo cfDNA Read Enrichment and Quality Assessment](https://doi.org/10.1002/advs.77327) (*Advanced Science*, 2026).
 
- It employs **DECENT-plus** (a deep learning model) to distinguish between maternal contamination and embryo-derived reads, followed by a multi-dimensional feature extraction process to facilitate embryo quality assessment (Probability of being a "High-quality Embryo").
+It employs **DECENT-plus** (a deep learning model) to distinguish between maternal contamination and embryo-derived reads, followed by a multi-dimensional feature extraction process to facilitate embryo quality assessment (probability of being a high-quality embryo).
 
 ---
 
@@ -205,5 +205,25 @@ NICE/
 
 ---
 
-**License**: [MIT License]
+## Citation
+
+If you use this code, please cite:
+
+Zhou, X., Ding, S., Zhang, Z., Shangguan, Q., Qiao, J., Zhou, P. & Chen, Y. NICE: A Two-Step Non-Invasive Framework for Embryo cfDNA Read Enrichment and Quality Assessment. *Advanced Science* (2026). https://doi.org/10.1002/advs.77327
+
+```bibtex
+@article{zhou2026nice,
+  title   = {NICE: A Two-Step Non-Invasive Framework for Embryo cfDNA Read Enrichment and Quality Assessment},
+  author  = {Zhou, Xueya and Ding, Shu and Zhang, Zhenyi and Shangguan, Qiaoling and Qiao, Jie and Zhou, Peijie and Chen, Yidong},
+  journal = {Advanced Science},
+  year    = {2026},
+  pages   = {e77327},
+  doi     = {10.1002/advs.77327},
+  url     = {https://doi.org/10.1002/advs.77327}
+}
+```
+
+---
+
+**License**: [MIT License](LICENSE)
 
